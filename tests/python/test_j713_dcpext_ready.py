@@ -8,7 +8,7 @@ from test_siliconforest_handoff import run_c
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_j713_dcpext_ready_is_opt_in_complete_and_reads_pmgr_only(tmp_path):
+def test_j713_dcpext_ready_defaults_on_j713_complete_and_reads_pmgr_only(tmp_path):
     kboot = (ROOT / "src/kboot.c").read_text()
     pmgr = (ROOT / "src/pmgr.c").read_text()
 
@@ -58,6 +58,7 @@ typedef uint8_t u8;
 #define bail(...) do { return -1; } while (0)
 ''' + pmgr_bits + r'''
 static void *dt, *adt;
+static bool chosen_lost;
 static u32 chip_id = T8132;
 /* fault applies to the controllers in victims (bit n = dcpextn). */
 static int fault, victims, reservations, attempts[2];
@@ -200,6 +201,7 @@ __attribute__((unused)) static u32 clear32(uintptr_t addr, u32 clear) { return p
 static void world(void)
 {
     fault = victims = reservations = attempts[0] = attempts[1] = 0;
+    chosen_lost = false;
     expected_status[0] = expected_status[1] = "disabled";
     pmgr_reads = pmgr_writes = 0;
     chip_id = T8132; pmgr_devices_len = ARRAY_SIZE(devices);
@@ -330,18 +332,56 @@ int main(void)
         assert(!pmgr_writes);
     }
 
-    /* Opt-in, and only after the internal DCP was handed over. */
+    /* Off a J713 the handoff needs the line, and only after the internal DCP was handed over. */
     world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
     unarmed();
-    const char *values[] = {"0", "", "11", "yes"};
-    for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
-        world();
-        assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext",
-                                   values[i]));
-        unarmed();
+    /* On a J713 it is on without the line (or without /chosen) and off with "0". */
+    for (int mode = 0; mode < 2; mode++) {
+        world(); stale_markers();
+        assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+        if (mode == 0)
+            assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+        else
+            assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
+        dt_reserve_j713_dcpext();
+        published(0);
+        published(1);
+        assert(!pmgr_writes);
     }
-    world(); assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", "1", 1));
-    unarmed(); /* "1" without its NUL */
+    world(); assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+    assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", "0"));
+    unarmed();
+    /* A lost config line may have been the owner's =0: no default. */
+    world(); assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+    chosen_lost = true;
+    unarmed();
+    world(); assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp"), "apple,firmware-uuid"));
+    assert(!fdt_delprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext"));
+    unarmed();
+    /* Any value but "1" keeps it off, on a J713 too, where no line means on. */
+    const char *values[] = {"0", "", "11", "yes"};
+    for (int j713 = 0; j713 < 2; j713++) {
+        for (unsigned i = 0; i < ARRAY_SIZE(values); i++) {
+            world();
+            if (j713)
+                assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+            assert(!fdt_setprop_string(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext",
+                                       values[i]));
+            unarmed();
+        }
+        world();
+        if (j713)
+            assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+        assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", "1", 1));
+        unarmed(); /* "1" without its NUL */
+        world();
+        if (j713)
+            assert(!fdt_setprop_string(dt, 0, "compatible", "apple,j713"));
+        assert(!fdt_setprop(dt, fdt_path_offset(dt, "/chosen"), "asahi,j713-dcpext", NULL, 0));
+        unarmed(); /* present but empty */
+    }
     world(); assert(!fdt_del_node(dt, fdt_path_offset(dt, "/chosen")));
     unarmed();
     world(); assert(!fdt_delprop(dt, fdt_path_offset(dt, "/soc/dcp"), "apple,firmware-uuid"));

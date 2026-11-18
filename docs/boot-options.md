@@ -140,23 +140,32 @@ set none.
 
 On the J713, iBoot starts both external display coprocessors, dcpext0 and
 dcpext1, and leaves them quiesced with their DARTs set up. A kernel that drives
-external displays adopts them as they are. With `chosen.asahi,j713-dcpext=1`
-in the aura configuration, kboot hands each one over: it reserves its firmware
-memory (the OS log segment by physical address, as for the internal DCP),
+external displays adopts them as they are. On the J713 kboot hands each one
+over by default (`chosen.asahi,j713-dcpext=0` in the aura configuration turns
+that off; elsewhere only `=1` turns it on). To hand one over, it reserves its
+firmware memory (the OS log segment by physical address, as for the internal DCP),
 publishes the firmware UUID and marks the node
-`apple,t8132-dcpext-firmware-ready`. The node stays disabled.
+`apple,t8132-dcpext-firmware-ready`. The node's status is left as the kernel's
+tree has it (current J713 trees mark it `okay`). A kernel without the J713
+external display driver ignores the marker and drives no external display.
 
 A controller is handed over only when:
 
 - the internal display was handed over too, so an external display never costs
   the panel;
-- its device-tree node is a disabled `apple,t8132-dcpext`;
+- its device-tree node is an `apple,t8132-dcpext` with status absent, `okay`,
+  `ok` or `disabled`;
 - iBoot left it powered: DISPEXTn SYS and FE on, and its CPU domain on or
   targeted on with hardware gating it while idle.
 
 PMGR is only read. The CPU domain and the controller are left to the kernel.
-The value must be exactly `1`. Without it, or when any check fails, nothing is
-reserved for that controller and a marker already in the tree is removed.
+With the line present the value must be exactly `1`; any other value turns the
+handoff off. Without the line, a J713 gets the handoff. When it is off, or when
+any check fails, nothing is reserved for that controller and a marker already
+in the tree is removed. When a config line was lost (for example, the config had
+too many `chosen` lines), the default does not apply, since an owner's `=0` may have
+been the line lost.
+
 kboot logs `FDT: 'dcpext0' firmware reserved, left to the kernel`, or the
 reason followed by `kernel gate remains closed`.
 
