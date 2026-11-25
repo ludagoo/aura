@@ -4890,6 +4890,83 @@ static bool dt_ave_compatible(const char *c)
     return true;
 }
 
+#define AVE_MAX_ENCODERS 8
+
+/*
+ * aurora,crc32 on the reservation of the segment at @phys, found through the memory-region of the
+ * encoder @dev that was just given it: the CRC of that segment. A segment two encoders share (the
+ * M2 Max's TEXT) is one reservation; a second encoder must find the same value there.
+ */
+static int dt_ave_stamp_crc(u32 dev, u64 phys, const char *value)
+{
+    int len, node = fdt_node_offset_by_phandle(dt, dev);
+    const fdt32_t *mr = node < 0 ? NULL : fdt_getprop(dt, node, "memory-region", &len);
+
+    for (int i = 0; mr && i < len / 4; i++) {
+        int rn = fdt_node_offset_by_phandle(dt, fdt32_to_cpu(mr[i])), rlen;
+        const fdt64_t *reg = rn < 0 ? NULL : fdt_getprop(dt, rn, "reg", &rlen);
+
+        if (!reg || rlen < (int)sizeof(*reg) || fdt64_to_cpu(reg[0]) != phys)
+            continue;
+        const char *have = fdt_getprop(dt, rn, "aurora,crc32", &rlen);
+        if (have)
+            return rlen == 9 && !memcmp(have, value, 9) ? 0 : -1;
+        return fdt_setprop_string(dt, rn, "aurora,crc32", value);
+    }
+    return -1;
+}
+
+/*
+ * Take a refused encoder (@dev, its phandle) out of the reservations it was given: its
+ * memory-region goes, and so does its tuple in each of those reservations' iommu-addresses. A
+ * reservation another encoder shares (the M2 Max's TEXT) keeps that encoder's tuple; the
+ * reservation itself stays, as the preloaded firmware is still in that memory.
+ */
+static int dt_ave_drop_refs(u32 dev)
+{
+    const int cells = 5; /* <&dev iova-hi iova-lo size-hi size-lo> */
+    u32 regions[4];
+    int len, count;
+
+    int node = dev ? fdt_node_offset_by_phandle(dt, dev) : -1;
+    const fdt32_t *mr = node < 0 ? NULL : fdt_getprop(dt, node, "memory-region", &len);
+    if (!mr)
+        return 0;
+    count = len / 4;
+    if (len % 4 || count > (int)ARRAY_SIZE(regions))
+        return -1;
+    for (int i = 0; i < count; i++)
+        regions[i] = fdt32_to_cpu(mr[i]);
+    if (fdt_delprop(dt, node, "memory-region"))
+        return -1;
+
+    for (int i = 0; i < count; i++) {
+        fdt32_t keep[AVE_MAX_ENCODERS * 5];
+        int rn = fdt_node_offset_by_phandle(dt, regions[i]), n = 0, ret;
+        const fdt32_t *ia = rn < 0 ? NULL : fdt_getprop(dt, rn, "iommu-addresses", &len);
+
+        if (!ia)
+            continue;
+        if (len % (cells * 4) || len / 4 > (int)ARRAY_SIZE(keep) + cells)
+            return -1;
+        for (int j = 0; j < len / 4; j += cells) {
+            if (fdt32_to_cpu(ia[j]) == dev)
+                continue;
+            if (n + cells > (int)ARRAY_SIZE(keep))
+                return -1;
+            memcpy(&keep[n], &ia[j], cells * sizeof(*keep));
+            n += cells;
+        }
+        if (n * 4 == len)
+            continue;
+        ret = n ? fdt_setprop(dt, rn, "iommu-addresses", keep, n * sizeof(*keep))
+                : fdt_delprop(dt, rn, "iommu-addresses");
+        if (ret)
+            return -1;
+    }
+    return 0;
+}
+
 /*
  * The compatible an encoder node is found again by, its first (the SoC's own), or NULL when the
  * node is not an encoder.
@@ -5204,24 +5281,6 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         crcs[i] = tinf_crc32((void *)seg[i].phys, seg[i].size);
 
     /*
-     * The driver checks every encoder's firmware against the one set of CRCs in /chosen. An
-     * encoder whose preloaded copy differs from that of an encoder already handed over is left
-     * off rather than overwrite them.
-     */
-    int crc_node = fdt_path_offset(dt, "/chosen");
-    for (size_t i = 0; crc_node >= 0 && i < count; i++) {
-        char prop[48], value[9];
-        int len;
-        snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
-        snprintf(value, sizeof(value), "%08x", crcs[i]);
-        const char *have = fdt_getprop(dt, crc_node, prop, &len);
-        if (have && (len != sizeof(value) || memcmp(have, value, sizeof(value)))) {
-            reason = "firmware differs from the encoder already handed over";
-            goto disable;
-        }
-    }
-
-    /*
      * The firmware runs where iBoot left it: TEXT at the start of the encoder's DART window,
      * the DART's ADT vm-base, and each segment at vm-base plus its offset (the ADT iova-offset).
      * That is 0 on the M1 family (vm-base 0), 0x800000000 on the M2, and 0x10000000000 on the M2
@@ -5294,12 +5353,25 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
         reason = "firmware reservation failed";
         goto disable;
     }
+    /*
+     * Each reservation carries its own segment's CRC: the encoders of one SoC need not have the
+     * same firmware copy (the M2 Max's two DATA images differ). /chosen keeps the first encoder's
+     * CRCs for a kernel that reads only /chosen; such a kernel checks a later encoder against
+     * them and refuses it if its copy differs.
+     */
     for (size_t i = 0; i < count; i++) {
         char prop[48], value[9];
         snprintf(prop, sizeof(prop), "aurora,ave-%s-crc32", normalized[i]);
         snprintf(value, sizeof(value), "%08x", crcs[i]);
+        int self = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
+        if (self < 0 || dt_ave_stamp_crc(fdt_get_phandle(dt, self), seg[i].phys, value)) {
+            reason = "reservation CRC differs or cannot be set";
+            goto disable;
+        }
+        /* Setting a property moves the nodes after it: find /chosen again each time. */
         int chosen = fdt_path_offset(dt, "/chosen");
-        if (chosen < 0 || fdt_setprop_string(dt, chosen, prop, value)) {
+        if (chosen < 0 ||
+            (!fdt_getprop(dt, chosen, prop, NULL) && fdt_setprop_string(dt, chosen, prop, value))) {
             reason = "CRC export failed";
             goto disable;
         }
@@ -5330,16 +5402,20 @@ static int dt_set_ave_node(int node, const char *compat, u32 phandle)
 
 disable:
     node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
-    if (node >= 0 && fdt_setprop_string(dt, node, "status", "disabled"))
-        return -1;
+    if (node >= 0) {
+        /* A later encoder may have joined a shared reservation before it was refused. */
+        if (dt_ave_drop_refs(fdt_get_phandle(dt, node)))
+            return -1;
+        node = phandle ? fdt_node_offset_by_phandle(dt, phandle) : dt_ave_next(-1, compat);
+        if (node < 0 || fdt_setprop_string(dt, node, "status", "disabled"))
+            return -1;
+    }
     if (phandle)
         printf("FDT: AVE %s disabled: %s\n", path, reason);
     else
         printf("FDT: AVE disabled: %s\n", reason);
     return 0;
 }
-
-#define AVE_MAX_ENCODERS 8
 
 /*
  * The next encoder node after @node whose FIRST compatible is @compat.

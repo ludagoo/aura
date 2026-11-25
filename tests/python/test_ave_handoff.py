@@ -10,7 +10,11 @@ libfdt. Covered:
   2. both M1 Max encoders are handed over, each from its own ADT node;
   3. an M1 Max encoder whose ADT node is absent, not preloaded or has a bad segment list is
      disabled, and encoder 0 is not;
-  4. an encoder whose preloaded copy differs from encoder 0's is disabled; the CRCs stay;
+  4. every firmware reservation carries aurora,crc32, the CRC of its own segment; an encoder
+     whose preloaded copy differs from encoder 0's is handed over with its own CRCs, and /chosen
+     keeps encoder 0's; the M2 Max's two encoders share one TEXT reservation (one tuple each in
+     its iommu-addresses) and have different DATA; an encoder refused after it joined a shared
+     reservation leaves no memory-region and no tuple behind, and encoder 0 keeps both;
   5. the M1 Ultra: two dies with the same die-local addresses, each node matched to the ADT
      encoder at its translated address;
   6. the M2 encoder's DART window base is read from the DART named after its ADT encoder;
@@ -288,14 +292,19 @@ int adt_getprop_copy(const void *a, int off, const char *name, void *out, size_t
     return plen;
 }
 
-/* The firmware copies are not in host memory: each segment's CRC is the model's. */
+/*
+ * The firmware copies are not in host memory: each segment's CRC is the model's. crc_flip_call
+ * makes that call (counted from 0) see a changed copy.
+ */
+static int crc_calls, crc_flip_call = -1;
 u32 tinf_crc32(const void *data, u32 size)
 {
     (void)size;
+    u32 flip = crc_calls++ == crc_flip_call ? 1 : 0;
     for (int i = 0; i < nanodes; i++)
         for (int j = 0; j < anodes[i].nseg; j++)
             if (anodes[i].seg[j].phys == (u64)data)
-                return anodes[i].crc[j];
+                return anodes[i].crc[j] ^ flip;
     return 0;
 }
 
@@ -401,6 +410,8 @@ static void tree(int dies)
     failing_entry = NULL;
     skipped_entry = NULL;
     chip_id = 0;
+    crc_calls = 0;
+    crc_flip_call = -1;
 }
 
 static int bus(int die)
@@ -479,6 +490,37 @@ static u64 iova_at(int die, u64 addr, int idx)
 static u64 iova(int die, u64 addr)
 {
     return iova_at(die, addr, 0);
+}
+
+/* The reservation of the segment at @phys, or -1. */
+static int resv_at(u64 phys)
+{
+    char name[64];
+    snprintf(name, sizeof(name), "/reserved-memory/asc-firmware@%llx", (unsigned long long)phys);
+    return fdt_path_offset(dt, name);
+}
+
+/* Its aurora,crc32, or "". */
+static const char *resv_crc(u64 phys)
+{
+    int n = resv_at(phys);
+    const char *s = n < 0 ? NULL : fdt_getprop(dt, n, "aurora,crc32", NULL);
+    return s ? s : "";
+}
+
+/* How many iommu-addresses tuples the reservation at @phys has, and whether one is @dev's. */
+static int resv_tuples(u64 phys, u32 dev, bool *has_dev)
+{
+    int len, n = resv_at(phys);
+    const fdt32_t *ia = n < 0 ? NULL : fdt_getprop(dt, n, "iommu-addresses", &len);
+    *has_dev = false;
+    if (!ia)
+        return 0;
+    assert(len % 20 == 0);
+    for (int i = 0; i < len / 4; i += 5)
+        if (fdt32_to_cpu(ia[i]) == dev)
+            *has_dev = true;
+    return len / 20;
 }
 
 static const char *chosen(const char *prop)
@@ -571,16 +613,81 @@ static int scenarios(void)
     CHECK(!strcmp(status(0, M1_ENC0), "disabled") && firmware(0, M1_ENC1, 0) == b->seg[0].phys);
     puts("PASS: encoder 0 absent: disabled, encoder 1 handed over");
 
-    /* 4: encoder 1's copy differs: it is disabled, encoder 0's CRCs stay. */
+    /*
+     * 4: encoder 1's copy differs: it is handed over too, each reservation with its own CRC;
+     * /chosen keeps encoder 0's.
+     */
     m1max();
-    add_encoder("ave0", M1_ENC0);
-    add_encoder("ave1", M1_ENC1)->crc[1] = 0xdeadbeef;
+    a = add_encoder("ave0", M1_ENC0);
+    b = add_encoder("ave1", M1_ENC1);
+    b->crc[1] = 0xdeadbeef;
     CHECK(!dt_set_ave());
-    CHECK(!strcmp(status(0, M1_ENC0), "okay") && !strcmp(status(0, M1_ENC1), "disabled"));
-    CHECK(!firmware(0, M1_ENC1, 0));
+    CHECK(!strcmp(status(0, M1_ENC0), "okay") && !strcmp(status(0, M1_ENC1), "okay"));
+    CHECK(firmware(0, M1_ENC1, 1) == b->seg[1].phys);
+    CHECK(!strcmp(resv_crc(a->seg[0].phys), "460c7a7c"));
+    CHECK(!strcmp(resv_crc(a->seg[1].phys), "12345678"));
+    CHECK(!strcmp(resv_crc(b->seg[0].phys), "460c7a7c"));
+    CHECK(!strcmp(resv_crc(b->seg[1].phys), "deadbeef"));
     CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "12345678"));
-    CHECK(strstr(logbuf, "differs from the encoder already handed over"));
-    puts("PASS: a differing firmware copy is refused, the published CRCs kept");
+    CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "460c7a7c"));
+    CHECK(!strstr(logbuf, "disabled"));
+    puts("PASS: a differing firmware copy is handed over with its own CRCs; /chosen keeps encoder 0's");
+
+    /*
+     * The M2 Max (T6021): two encoders, each at its own DART's window, sharing one TEXT copy
+     * (one reservation, one iommu-addresses tuple each) with different DATA.
+     */
+    for (int refuse = 0; refuse < 2; refuse++) {
+        tree(1);
+        encoder(0, "apple,t6021-ave", M1_ENC1, "okay");
+        encoder(0, "apple,t6021-ave", M1_ENC0, "okay");
+        a = add_encoder("ave0", M1_ENC0);
+        b = add_encoder("ave1", M1_ENC1);
+        a->seg[0] = (struct adt_segment_ranges){a->seg[0].phys, 0, 0, 0xf0000, 0};
+        a->seg[1] = (struct adt_segment_ranges){a->seg[1].phys, 0xf0000, 0, 0x134000, 0};
+        b->seg[0] = a->seg[0];
+        b->seg[1] = (struct adt_segment_ranges){b->seg[1].phys, 0xf0000, 0, 0x134000, 0};
+        a->crc[0] = b->crc[0] = 0x6fbc7f77;
+        a->crc[1] = 0x9e559ea2;
+        b->crc[1] = 0xd142e9b5;
+        add_dart("dart-ave0", 0x10000000000ULL);
+        add_dart("dart-ave1", 0x10000000000ULL);
+        /*
+         * refuse: encoder 1 reads a TEXT CRC other than the one the shared reservation already
+         * has (its first CRC, the third computed), after it joined that reservation.
+         */
+        if (refuse)
+            crc_flip_call = 2;
+        CHECK(!dt_set_ave());
+        u32 p0 = fdt_get_phandle(dt, enc(0, M1_ENC0)), p1 = fdt_get_phandle(dt, enc(0, M1_ENC1));
+        bool has0, has1;
+        CHECK(p0 && p1);
+        CHECK(!strcmp(status(0, M1_ENC0), "okay"));
+        CHECK(firmware(0, M1_ENC0, 0) == a->seg[0].phys && firmware(0, M1_ENC0, 1) == a->seg[1].phys);
+        CHECK(iova_at(0, M1_ENC0, 0) == 0x10000000000ULL);
+        CHECK(!strcmp(resv_crc(a->seg[0].phys), "6fbc7f77"));
+        CHECK(!strcmp(resv_crc(a->seg[1].phys), "9e559ea2"));
+        CHECK(!strcmp(chosen("aurora,ave-text-crc32"), "6fbc7f77"));
+        CHECK(!strcmp(chosen("aurora,ave-data-crc32"), "9e559ea2"));
+        if (!refuse) {
+            CHECK(!strcmp(status(0, M1_ENC1), "okay"));
+            CHECK(firmware(0, M1_ENC1, 0) == a->seg[0].phys);
+            CHECK(firmware(0, M1_ENC1, 1) == b->seg[1].phys);
+            CHECK(resv_tuples(a->seg[0].phys, p0, &has0) == 2 && has0);
+            CHECK(resv_tuples(a->seg[0].phys, p1, &has1) == 2 && has1);
+            CHECK(!strcmp(resv_crc(b->seg[1].phys), "d142e9b5"));
+            CHECK(strstr(logbuf, "video-codec@507100000 handed over from ADT /arm-io/ave1"));
+            puts("PASS: M2 Max: both encoders handed over, shared TEXT, a CRC on each reservation");
+        } else {
+            CHECK(!strcmp(status(0, M1_ENC1), "disabled"));
+            CHECK(!fdt_getprop(dt, enc(0, M1_ENC1), "memory-region", NULL));
+            CHECK(resv_tuples(a->seg[0].phys, p0, &has0) == 1 && has0);
+            CHECK(resv_tuples(a->seg[0].phys, p1, &has1) == 1 && !has1);
+            CHECK(resv_tuples(b->seg[1].phys, p1, &has1) == 0 && !has1);
+            CHECK(strstr(logbuf, "video-codec@507100000 disabled: reservation CRC differs"));
+            puts("PASS: M2 Max: encoder 1 refused after joining the TEXT reservation leaves no reference");
+        }
+    }
 
     /* 5: the M1 Ultra: die 1 repeats die 0's die-local addresses. */
     tree(2);
@@ -1075,4 +1182,4 @@ def test_ave_handoff(tmp_path):
     binary = build(tmp_path, (repo / "src/kboot.c").read_text())
     run = subprocess.run([str(binary)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout + run.stderr
-    assert run.stdout.count("PASS:") == 36, run.stdout
+    assert run.stdout.count("PASS:") == 38, run.stdout
